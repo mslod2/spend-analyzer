@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Spend Analyzer tests</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 24px; }
+  .pass { color: #006300; } .fail { color: #d03b3b; font-weight: 600; }
+  pre { margin: 0 0 0 16px; color: #52514e; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>Spend Analyzer tests</h1>
+<p id="summary">Running…</p>
+<div id="results"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.6.1/papaparse.min.js"></script>
+<script src="../js/util.js"></script>
+<script src="../js/defaults.js"></script>
+<script src="../js/normalize.js"></script>
+<script src="../js/importer.js"></script>
+<script src="../js/rules.js"></script>
+<script src="../js/analytics.js"></script>
+<script src="fixtures/fixtures.js"></script>
+<script>
+(function () {
+  const results = [];
+  function test(name, fn) {
+    try { fn(); results.push({ name, ok: true }); }
+    catch (e) { results.push({ name, ok: false, msg: e.message }); }
+  }
+  function eq(actual, expected, label) {
+    const a = JSON.stringify(actual), e = JSON.stringify(expected);
+    if (a !== e) throw new Error((label ? label + ': ' : '') + 'expected ' + e + ', got ' + a);
+  }
+  function ok(cond, label) { if (!cond) throw new Error(label || 'assertion failed'); }
+
+  const N = SA.normalize, I = SA.importer, R = SA.rules, A = SA.analytics, D = SA.defaults;
+
+  function importFixture(name, account) {
+    const rows = I.parseCsv(FIXTURES[name]);
+    const headerRow = I.detectHeaderRow(rows);
+    const m = I.guessMapping(rows, headerRow);
+    const res = I.applyMapping(rows, m, account || name, 'imp_' + name);
+    const ctx = R.buildContext([], D.defaultSettings());
+    for (const t of res.transactions) Object.assign(t, R.categorize(t, ctx));
+    return { rows, headerRow, m, res };
+  }
+
+  // --- normalize ---
+  test('parseAmount formats', () => {
+    eq(N.parseAmount('$1,234.56'), 1234.56);
+    eq(N.parseAmount('(12.00)'), -12);
+    eq(N.parseAmount('-12.5'), -12.5);
+    eq(N.parseAmount('12.00-'), -12);
+    eq(N.parseAmount('45.10 CR'), -45.1);
+    eq(N.parseAmount(''), null);
+    eq(N.parseAmount('abc'), null);
+  });
+  test('parseDate formats', () => {
+    eq(N.parseDate('09/03/2026', 'MDY'), '2026-09-03');
+    eq(N.parseDate('03/09/2026', 'DMY'), '2026-09-03');
+    eq(N.parseDate('2026-09-03'), '2026-09-03');
+    eq(N.parseDate('9/3/26', 'MDY'), '2026-09-03');
+    eq(N.parseDate('Sep 3, 2026'), '2026-09-03');
+    eq(N.parseDate('03 Sep 2026'), '2026-09-03');
+    eq(N.parseDate('02/30/2026', 'MDY'), null);
+    eq(N.parseDate('Transaction Date'), null);
+  });
+  test('HTML entities in CSV cells are decoded', () => {
+    const rows = I.parseCsv('Date,Description,Amount\n09/01/2026,MAPLE SMOKE &amp; DELI,4.50\n');
+    eq(rows[1][1], 'MAPLE SMOKE & DELI');
+  });
+  test('detectDateFormat', () => {
+    eq(N.detectDateFormat(['01/02/2026', '25/02/2026']), 'DMY');
+    eq(N.detectDateFormat(['01/02/2026', '02/25/2026']), 'MDY');
+    eq(N.detectDateFormat(['2026-01-02']), 'YMD');
+  });
+  test('cleanMerchant', () => {
+    eq(N.cleanMerchant('SQ *BLUE BOTTLE COFFEE'), 'Blue Bottle Coffee');
+    eq(N.cleanMerchant('SQ *BLUE BOTTLE COFFEE  OAKLAND  CA'), 'Blue Bottle Coffee');
+    eq(N.cleanMerchant('TST* NOPALITO'), 'Nopalito');
+    eq(N.cleanMerchant('AMZN Mktp US*2K4AB1CD0'), 'Amazon');
+    eq(N.cleanMerchant('AMAZON MARKETPLACE NA PA  SEATTLE  WA'), 'Amazon');
+    eq(N.cleanMerchant('SHELL OIL 57444381201'), 'Shell');
+    eq(N.cleanMerchant('TARGET 00012345'), 'Target');
+    eq(N.cleanMerchant('CHIPOTLE 1234'), 'Chipotle');
+    eq(N.cleanMerchant('CVS/PHARMACY #09876'), 'CVS');
+    eq(N.cleanMerchant('PG&E WEBRECURRING'), 'PG&E Webrecurring');
+    eq(N.cleanMerchant('PG&E/EZ-PAY  SAN FRANCISCO  CA'), 'PG&E/Ez-Pay');
+    eq(N.cleanMerchant('COMCAST CALIFORNIA'), 'Comcast California');
+    eq(N.cleanMerchant('WHOLE FOODS MARKET  OAKLAND  CA'), 'Whole Foods');
+    eq(N.cleanMerchant("TRADER JOE S #123"), "Trader Joe's");
+    eq(N.cleanMerchant('LOCAL SHOP*AB12CD'), 'Local Shop');
+    // Chase-style descriptions
+    eq(N.cleanMerchant('TM *TICKETMASTER'), 'Ticketmaster');
+    eq(N.cleanMerchant('CL *Chase Travel'), 'Chase Travel');
+    eq(N.cleanMerchant('PMT*STATE BUREAU MOTOR VEHIC'), 'State Bureau Motor Vehic');
+    eq(N.cleanMerchant('FH* HARBOR ISLAND FER'), 'Harbor Island Fer');
+    eq(N.cleanMerchant('OTTER* SUNNY BITES'), 'Sunny Bites');
+    eq(N.cleanMerchant('AIRBNB * HM2EXAMPLE'), 'Airbnb');
+    eq(N.cleanMerchant('PROGRESSIVE *INSURANCE'), 'Progressive');
+    eq(N.cleanMerchant('Etsy.com*ExampleShop'), 'Etsy');
+    eq(N.cleanMerchant('BP#1234567MAIN ST GAS &amp;'), 'BP');
+    eq(N.cleanMerchant('TST*RIVER &amp; RAIL KITCHE'), 'River & Rail Kitche');
+    eq(N.cleanMerchant('SQ *MORNING COFFEE &amp;'), 'Morning Coffee');
+    eq(N.cleanMerchant('SAMPLE CANDY KITCHEN ('), 'Sample Candy Kitchen');
+    eq(N.cleanMerchant('COSTCO GAS #0001'), 'Costco Gas');
+    eq(N.cleanMerchant('COSTCO WHSE #0002'), 'Costco');
+    eq(N.cleanMerchant('WWW COSTCO COM'), 'Costco');
+    eq(N.cleanMerchant('SAMSCLUB #0003'), "Sam's Club");
+    eq(N.cleanMerchant('SAMS CLUB #0003'), "Sam's Club");
+    eq(N.cleanMerchant('Amazon Digit*ABC123XYZ'), 'Amazon Digital');
+    eq(N.cleanMerchant('Prime Video *AB12CD34E'), 'Amazon Prime');
+    eq(N.cleanMerchant('LYFT   *RIDE MON 5PM'), 'Lyft');
+    eq(N.cleanMerchant('TARGET        00054321'), 'Target');
+    eq(N.cleanMerchant('DICE.FM'), 'Dice.fm');
+    eq(N.cleanMerchant('1001 SAMPLE INDIAN BBQ'), 'Sample Indian BBQ');
+    eq(N.cleanMerchant('LOWES #00001*'), "Lowe's");
+    // Citi collapses "NAME  CITY  ST" padding to single spaces (location stripping is enabled per file)
+    const L = (d) => N.cleanMerchant(d, { location: true });
+    eq(L('EXAMPLE TAVERN DAYTON OH'), 'Example Tavern');
+    eq(L('RIVERSIDE WINE & BEVERAG MAPLE HTS NJ'), 'Riverside Wine & Beverag');
+    eq(L('TST* WEST BAY INN PELICAN ISLAN FL'), 'West Bay Inn');
+    eq(L('TST*SAMPLE TACOS North Littler AR'), 'Sample Tacos');
+    eq(L('FH* HARBOR ISLAND FER PORTSMOUTH NH'), 'Harbor Island Fer');
+    eq(L('TACO BELL TROY NY'), 'Taco Bell');
+    eq(L('SHEETZ ALTOONA PA'), 'Sheetz');
+    eq(L('TST* NOPALITO SAN FRANCISCO CA'), 'Nopalito');
+    eq(L('SHEETZ NORTH WALES PA'), 'Sheetz');
+    eq(L('BURGER KING SAN JOSE CA'), 'Burger King');
+    eq(L('CVS/PHARMACY #01234 CEDAR HEIGHT MI'), 'CVS');
+    eq(L('365 MARKET FP TROY MI'), '365 Market');
+    eq(L('365 MARKET 888 432-32 TROY MI'), '365 Market');
+    eq(L('SPEEDWAY 12345 SPRINGFIELD IL'), 'Speedway');
+    eq(L('GIANT-EAGLE #0001 PITTSBURGH PA'), 'Giant Eagle');
+    eq(L('WM SUPERCENTER #0001 SOUTH BEND IN'), 'Walmart');
+    eq(L('CHICK-FIL-A #00001 ATLANTA GA'), 'Chick-fil-A');
+    eq(L('PIER 3- 2 DAYTON OH'), 'Pier 3');
+    // Simple Amex export
+    eq(N.cleanMerchant('AMAZON MARKEPLACE NA PA'), 'Amazon');
+    eq(N.cleanMerchant('AplPay APPLE.COM/BILINTERNET CHARGE     CA'), 'Apple');
+    eq(N.cleanMerchant('CRATEANDBARREL.COM  NAPERVILLE          IL'), 'Crate & Barrel');
+    eq(N.cleanMerchant('CRATE AND BARREL'), 'Crate & Barrel');
+    eq(N.cleanMerchant('PLAYSTATION NETWORK 800-345-7669        CA'), 'Playstation Network');
+    eq(N.cleanMerchant('SP ACME-SHOP-000001  AUSTIN              TX'), 'Acme-Shop-000001');
+    // No location to strip
+    eq(N.cleanMerchant('SQ *FARM CITY COFFEE @ NF'), 'Farm City Coffee @ Nf');
+    eq(L('SAKS CO'), 'Saks Co');
+    eq(L('PROPARK: LIGHTNING PAY HARTFORD CT null XXXXXXXXXXXX0000'), L('PROPARK: LIGHTNING PAY HARTFORD CT'), 'masked card number dropped');
+    eq(N.hasLocations(['METROPOLIS PARKING DENVER CO null XXXXXXXXXXXX0000', 'X Y DAYTON OH']), true);
+    eq(N.cleanMerchant('PY *GOLDEN YOLK EGG CA'), 'Golden Yolk Egg Ca', 'no stripping unless the file has locations');
+    eq(N.hasLocations(['EXAMPLE TAVERN DAYTON OH', 'SHELL OIL 123 SALEM OR', 'ONLINE PAYMENT, THANK YOU']), true);
+    eq(N.hasLocations(['PY *GOLDEN YOLK EGG CA', 'CHIPOTLE 0001', 'COSTCO GAS #0001']), false);
+  });
+
+  // --- importer ---
+  test('Chase: mapping guess', () => {
+    const { headerRow, m } = importFixture('chase');
+    eq(headerRow, 0);
+    eq(m.columns, { date: 0, description: 2, amount: 5, debit: null, credit: null, category: 3, type: 4, merchant: null, status: null });
+    eq(m.amountMode, 'single');
+    eq(m.chargesArePositive, false, 'Chase charges are negative');
+    eq(m.dateFormat, 'MDY');
+  });
+  test('Chase: payments excluded, refunds kept negative', () => {
+    const { res } = importFixture('chase');
+    eq(res.skipped.length, 0, 'skipped');
+    const pays = res.transactions.filter((t) => t.category === D.PAYMENTS);
+    eq(pays.length, 5, 'one payment per month');
+    ok(pays.every((t) => t.amount < 0 && t.categorySource === 'payment'), 'payments are credits');
+    const refund = res.transactions.find((t) => t.amount === -42.17);
+    ok(refund, 'refund present');
+    eq(refund.category, 'Shopping');
+    eq(refund.merchant, 'Target');
+    const coffee = res.transactions.find((t) => t.merchant === 'Blue Bottle Coffee');
+    eq(coffee.category, 'Dining');
+    ok(coffee.amount > 0, 'charges positive after normalization');
+  });
+  test('Chase: identical same-day rows get distinct ids; overlapping export dedupes', () => {
+    const a = importFixture('chase').res.transactions;
+    const b = importFixture('chase_overlap').res.transactions.map((t) => t); // different importId, same account below
+    const aIds = new Set(a.map((t) => t.id));
+    eq(aIds.size, a.length, 'unique ids within file');
+    const twins = a.filter((t) => t.date === '2026-08-03' && t.amount === 6.5);
+    eq(twins.length, 2);
+    const rows = I.parseCsv(FIXTURES.chase_overlap);
+    const m = I.guessMapping(rows, I.detectHeaderRow(rows));
+    const overlap = I.applyMapping(rows, m, 'chase', 'imp_x').transactions;
+    ok(overlap.length > 0);
+    ok(overlap.every((t) => aIds.has(t.id)), 'every overlapping row is a duplicate');
+  });
+  test('Amex: multiline fields, positive charges, Group-Subgroup categories', () => {
+    const { m, res } = importFixture('amex');
+    eq(m.columns.date, 0); eq(m.columns.description, 1); eq(m.columns.amount, 4); eq(m.columns.category, 12);
+    eq(m.chargesArePositive, true);
+    eq(res.skipped.length, 0);
+    const groceries = res.transactions.find((t) => t.merchant === 'Whole Foods');
+    eq(groceries.category, 'Groceries');
+    eq(res.transactions.find((t) => t.merchant === 'Shell').category, 'Gas & Auto');
+    eq(res.transactions.find((t) => t.merchant === 'Uber').category, 'Transportation');
+    eq(res.transactions.filter((t) => t.category === D.PAYMENTS).length, 5);
+  });
+  test('Capital One: split debit/credit, ISO dates', () => {
+    const { m, res } = importFixture('capitalone');
+    eq(m.amountMode, 'split');
+    eq(m.columns.debit, 5); eq(m.columns.credit, 6);
+    eq(m.dateFormat, 'YMD');
+    eq(res.transactions.filter((t) => t.category === D.PAYMENTS).length, 5);
+    eq(res.transactions.find((t) => t.amount === -42.17).category, 'Shopping');
+    eq(res.transactions.find((t) => t.merchant === 'Amazon').category, 'Shopping');
+  });
+  test('Wells Fargo: no header row, content-sniffed columns', () => {
+    const { headerRow, m, res } = importFixture('wellsfargo');
+    eq(headerRow, -1);
+    eq(m.columns.date, 0); eq(m.columns.amount, 1); eq(m.columns.description, 4);
+    eq(m.chargesArePositive, false);
+    eq(res.transactions.length, 41);
+    eq(res.transactions.filter((t) => t.category === D.PAYMENTS).length, 1);
+    const chip = res.transactions.find((t) => t.merchant === 'Chipotle');
+    eq([chip.category, chip.categorySource], ['Dining', 'keyword'], 'no issuer category: guessed from the name');
+  });
+  test('Citi: status column, negative credits, pending skipped, rewards detected', () => {
+    const { m, res } = importFixture('citi', 'Citi');
+    eq(m.amountMode, 'split');
+    eq(m.columns.status, 0);
+    eq(res.skipped.map((x) => x.reason), ['Pending']);
+    const pay = res.transactions.find((t) => /ONLINE PAYMENT/.test(t.description));
+    eq([pay.amount, pay.category], [-850, D.PAYMENTS]);
+    const pts = res.transactions.find((t) => /Points Redeemed/.test(t.description));
+    eq([pts.amount, pts.category, pts.categorySource], [-25, D.REWARDS, 'reward']);
+    eq(res.transactions.find((t) => t.amount === -42.17).merchant, 'Target');
+    ok(res.transactions.filter((t) => t.amount > 0).every((t) => !/ Ca$| Oakland| San Francisco/.test(t.merchant)), 'city/state stripped');
+  });
+  test('Amex simple export: sign, payment, cash-back reward', () => {
+    const { m, res } = importFixture('amex_simple', 'Amex');
+    eq(m.chargesArePositive, true);
+    eq(res.transactions.map((t) => t.merchant), ['Mobile Payment - Thank You', 'Amazon', 'Apple', 'Your Cash Reward/Refund Is', 'Crate & Barrel', 'Example-Shop-000001', 'Netflix']);
+    eq(res.transactions.map((t) => t.category), [D.PAYMENTS, 'Shopping', D.UNCATEGORIZED, D.REWARDS, 'Home', D.UNCATEGORIZED, 'Subscriptions']);
+  });
+  test('learned categories: merchants inherit their category from other cards', () => {
+    const chase = importFixture('chase', 'Chase').res.transactions;
+    const citiRows = I.parseCsv(FIXTURES.citi);
+    const citi = I.applyMapping(citiRows, I.guessMapping(citiRows, 0), 'Citi', 'c').transactions;
+    const ctx = R.buildContext([], D.defaultSettings(), chase);
+    for (const t of citi) Object.assign(t, R.categorize(t, ctx));
+    const bb = citi.find((t) => t.merchant === 'Blue Bottle Coffee');
+    eq([bb.category, bb.categorySource], ['Dining', 'learned']);
+    eq(citi.find((t) => t.merchant === 'Shell').category, 'Gas & Auto');
+    const unknown = citi.filter((t) => t.amount > 0 && t.category === D.UNCATEGORIZED).map((t) => t.merchant + ' <= ' + t.description);
+    eq(unknown, [], 'every purchase merchant is known from Chase');
+    // Learned never overrides a rule or an issuer category, and never learns from payments.
+    const ctx2 = R.buildContext([{ id: 'r', field: 'merchant', matchType: 'equals', pattern: 'shell', category: 'Travel' }], D.defaultSettings(), chase);
+    eq(R.categorize(citi.find((t) => t.merchant === 'Shell'), ctx2).category, 'Travel');
+    eq(ctx.learned.has('payment thank you-mobile'), false);
+  });
+  test('keyword guesses: last resort for issuers without categories', () => {
+    const g = (merchant, description) => R.categorize({ merchant, description, amount: 10 }, R.buildContext([], D.defaultSettings())).category;
+    eq(g('Prime Steaks Inc', 'PRIME STEAKS INC. DAYTON OH'), 'Dining');
+    eq(g('River Brewing', 'TST*RIVER BREWING Dayton OH'), 'Dining');
+    eq(g('Some Place', 'TST*SOME PLACE Dayton OH'), 'Dining', 'Toast POS prefix');
+    eq(g('365 Market', '365 MARKET FP TROY MI'), 'Dining');
+    eq(g("Anna's Supermarket", "ANNA'S SUPERMARKET #22 MAPLE HTS NJ"), 'Groceries');
+    eq(g('Island Market', 'ISLAND MARKET PELICAN IS FL'), 'Groceries');
+    eq(g('Main and Market Deck', 'MAIN AND MARKET DECK'), 'Transportation', 'parking beats the word MARKET');
+    eq(g('Sunoco', 'SUNOCO 1234567890 QPS DAYTON OH'), 'Gas & Auto');
+    eq(g('76 - Example Road', '76 - EXAMPLE ROAD 76 RENO NV'), 'Gas & Auto');
+    eq(g('Autozone', 'AUTOZONE #0001 DAYTON OH'), 'Gas & Auto');
+    eq(g('State Turnpike', 'STATE TURNPIKE PLAZA NEWARK NJ'), 'Transportation');
+    eq(g('United', 'UNITED 01600000000000 HOUSTON TX'), 'Travel');
+    eq(g('United Way', 'UNITED WAY OF GREATER DAYTON'), 'Gifts & Donations');
+    eq(g('Harbor Island Fer', 'FH* HARBOR ISLAND FER PORTSMOUTH NH'), 'Travel');
+    eq(g('Vca Animal Hosp', 'VCA ANIMAL HOSP #001 SPRINGFIELD IL'), 'Personal Care');
+    eq(g('Dayton Cinemas', 'DAYTON CINEMAS - CE DAYTON OH'), 'Entertainment');
+    eq(g('Oak Road Liquor', 'OAK ROAD LIQUOR DAYTON OH'), 'Groceries');
+    eq(g('Petit Fours', 'PETIT FOURS DAYTON OH'), D.UNCATEGORIZED, 'no false positive on PET');
+    eq(g('Casa', 'TST* CASA - DAYTON DAYTON OH'), 'Dining');
+    // Never overrides anything the user or issuer said, and skips categories the user deleted.
+    const ctx = R.buildContext([], D.defaultSettings());
+    eq(R.categorize({ merchant: 'Pizza Hut', description: 'PIZZA HUT', amount: 10, issuerCategory: 'Shopping' }, ctx).category, 'Shopping');
+    const noDining = Object.assign(D.defaultSettings(), { categories: D.CATEGORIES.filter((c) => c !== 'Dining') });
+    eq(R.categorize({ merchant: 'Pizza Hut', description: 'PIZZA HUT', amount: 10 }, R.buildContext([], noDining)).category, D.UNCATEGORIZED);
+  });
+  test('rewards: only credits; rules override', () => {
+    const ctx = R.buildContext([], D.defaultSettings());
+    eq(R.categorize({ merchant: 'X', description: 'REWARDS CLUB MEMBERSHIP', amount: 50 }, ctx).category, D.UNCATEGORIZED);
+    eq(R.categorize({ merchant: 'Annual Hotel Credit', description: 'ANNUAL HOTEL CREDIT', amount: -50 }, ctx).category, D.REWARDS);
+    const ctx2 = R.buildContext([{ id: 'r', field: 'description', matchType: 'contains', pattern: 'hotel credit', category: 'Travel' }], D.defaultSettings());
+    eq(R.categorize({ merchant: 'Annual Hotel Credit', description: 'ANNUAL HOTEL CREDIT', amount: -50 }, ctx2).category, 'Travel');
+    ok(D.defaultSettings().excludedCategories.includes(D.REWARDS), 'rewards excluded from spending by default');
+  });
+  test('preamble lines before header are skipped', () => {
+    const rows = I.parseCsv('Account Summary\nCard ending 1234,,\n\nDate,Description,Amount\n09/01/2026,COFFEE SHOP,4.50\n09/02/2026,BOOK STORE,12.00\n');
+    const h = I.detectHeaderRow(rows);
+    eq(rows[h], ['Date', 'Description', 'Amount']);
+    const m = I.guessMapping(rows, h);
+    eq(I.applyMapping(rows, m, 'x', 'i').transactions.length, 2);
+  });
+
+  // --- rules ---
+  test('rules: precedence and specificity', () => {
+    const txn = { merchant: 'Blue Bottle Coffee', description: 'SQ *BLUE BOTTLE COFFEE', amount: 6, issuerCategory: 'Food & Drink' };
+    const rules = [
+      { id: 'a', field: 'merchant', matchType: 'contains', pattern: 'coffee', category: 'Coffee', createdAt: '1' },
+      { id: 'b', field: 'merchant', matchType: 'contains', pattern: 'blue bottle', category: 'Treats', createdAt: '2' },
+    ];
+    const ctx = R.buildContext(rules, D.defaultSettings());
+    eq(R.categorize(txn, ctx), { category: 'Treats', categorySource: 'rule', ruleId: 'b' }, 'longer pattern wins');
+    const ctx2 = R.buildContext(rules.concat({ id: 'c', field: 'merchant', matchType: 'equals', pattern: 'blue bottle coffee', category: 'Dining', createdAt: '3' }), D.defaultSettings());
+    eq(R.categorize(txn, ctx2).ruleId, 'c', 'equals beats contains');
+    eq(R.categorize(Object.assign({}, txn, { categorySource: 'manual', category: 'Gifts & Donations' }), ctx2).category, 'Gifts & Donations', 'manual wins');
+    eq(R.categorize(txn, R.buildContext([], D.defaultSettings())).category, 'Dining', 'issuer fallback');
+  });
+  test('rules: payment detection only for credits; rules can re-map issuer payment categories', () => {
+    const ctx = R.buildContext([], D.defaultSettings());
+    eq(R.categorize({ merchant: 'X', description: 'PAYMENT PROCESSING FEE', amount: 5 }, ctx).category, D.UNCATEGORIZED);
+    eq(R.categorize({ merchant: 'X', description: 'AUTOPAY PAYMENT - THANK YOU', amount: -500 }, ctx).category, D.PAYMENTS);
+    const refund = { merchant: 'Target', description: 'TARGET', amount: -20, issuerCategory: 'Payment/Credit' };
+    eq(R.categorize(refund, ctx).category, D.PAYMENTS, 'issuer says payment');
+    const ctx2 = R.buildContext([{ id: 'r', field: 'merchant', matchType: 'equals', pattern: 'target', category: 'Shopping' }], D.defaultSettings());
+    eq(R.categorize(refund, ctx2).category, 'Shopping', 'rule overrides issuer payment category');
+  });
+  test('rules: unmapped issuer category passes through; bad regex never matches', () => {
+    const ctx = R.buildContext([{ id: 'r', field: 'merchant', matchType: 'regex', pattern: '(', category: 'X' }], D.defaultSettings());
+    eq(R.categorize({ merchant: 'A', description: 'A', amount: 3, issuerCategory: 'Pets' }, ctx), { category: 'Pets', categorySource: 'issuer', ruleId: null });
+    ok(R.isValidRule({ pattern: '(', matchType: 'regex', category: 'X' }));
+  });
+
+  // --- analytics ---
+  test('analytics: income conversion', () => {
+    eq(A.monthlyIncome({ mode: 'monthly', monthly: 6000 }), 6000);
+    eq(A.monthlyIncome({ mode: 'paycheck', paycheck: 3000, frequency: 'biweekly' }), 6500);
+    eq(A.monthlyIncome({ mode: 'paycheck', paycheck: 1000, frequency: 'weekly' }), 52000 / 12);
+    eq(A.monthlyIncome({ mode: 'monthly', monthly: '' }), null);
+  });
+  test('analytics: periods anchor on latest data month', () => {
+    const months = ['2026-05', '2026-06', '2026-07', '2026-08', '2026-09'];
+    eq(A.resolvePeriod('3m', null, months).months, ['2026-07', '2026-08', '2026-09']);
+    eq(A.resolvePeriod('12m', null, months).months.length, 5, 'clamped to first data month');
+    eq(A.resolvePeriod('prev', null, months).months, ['2026-08']);
+    eq(A.resolvePeriod('ytd', null, months).from, '2026-05');
+    eq(A.resolvePeriod('custom', { from: '2026-08', to: '2026-06' }, months).months, ['2026-06', '2026-07', '2026-08']);
+  });
+  test('analytics: month / week / day buckets', () => {
+    eq(A.weekStart('2026-09-29'), '2026-09-27', 'Tuesday → previous Sunday');
+    eq(A.weekStart('2026-09-27'), '2026-09-27', 'Sunday is its own week start');
+    eq(A.bucketKeys('2026-08-30', '2026-09-02', 'day'), ['2026-08-30', '2026-08-31', '2026-09-01', '2026-09-02']);
+    eq(A.bucketKeys('2026-09-01', '2026-09-15', 'week'), ['2026-08-30', '2026-09-06', '2026-09-13']);
+    eq(A.bucketKeys('2026-11-20', '2027-01-03', 'month'), ['2026-11', '2026-12', '2027-01']);
+    eq(A.bucketKeys('2026-02-28', '2026-03-01', 'day'), ['2026-02-28', '2026-03-01'], 'month boundary');
+    eq(A.incomePerBucket(5200, 'week'), 1200);
+    eq(A.incomePerBucket(null, 'day'), null);
+    const txns = [
+      { date: '2026-09-01', amount: 10, category: 'Dining' }, { date: '2026-09-05', amount: 5, category: 'Dining' },
+      { date: '2026-09-07', amount: 20, category: 'Groceries' }, { date: '2026-09-07', amount: -4, category: 'Groceries' },
+      { date: '2026-09-08', amount: -100, category: D.PAYMENTS }, { date: '2026-08-31', amount: 99, category: 'Dining' },
+    ];
+    const w = A.timeSeries(txns, { excluded: new Set([D.PAYMENTS]), grain: 'week', start: '2026-09-01', end: '2026-09-10' });
+    eq(w.keys, ['2026-08-30', '2026-09-06']);
+    eq(w.totals, { '2026-08-30': 15, '2026-09-06': 16 }, 'Aug 31 is outside the range even though its week is shown');
+    eq(w.byCat, { Dining: { '2026-08-30': 15 }, Groceries: { '2026-09-06': 16 } });
+    const d = A.timeSeries(txns, { excluded: new Set([D.PAYMENTS]), grain: 'day', start: '2026-09-06', end: '2026-09-08' });
+    eq(d.totals, { '2026-09-06': 0, '2026-09-07': 16, '2026-09-08': 0 });
+  });
+  test('analytics: summarize nets refunds and excludes payments', () => {
+    const txns = [
+      { date: '2026-07-01', amount: 100, category: 'Shopping', merchant: 'Target' },
+      { date: '2026-07-14', amount: -40, category: 'Shopping', merchant: 'Target' },
+      { date: '2026-07-10', amount: 60, category: 'Dining', merchant: 'Chipotle' },
+      { date: '2026-08-02', amount: 40, category: 'Dining', merchant: 'Chipotle' },
+      { date: '2026-07-25', amount: -160, category: D.PAYMENTS, merchant: 'Payment' },
+    ];
+    const s = A.summarize(txns, { excluded: new Set([D.PAYMENTS]), monthlyIncome: 1000, months: ['2026-07', '2026-08'] });
+    eq(s.total, 160);
+    eq(s.credits, 40);
+    eq(s.byCategory.map((c) => [c.category, c.total]), [['Dining', 100], ['Shopping', 60]]);
+    eq(s.byCategory[0].pctSpend, 100 / 160);
+    eq(s.byCategory[0].pctIncome, 100 / 2000);
+    eq(s.pctIncome, 160 / 2000);
+    eq(s.monthTotals, { '2026-07': 120, '2026-08': 40 });
+    eq(s.catMonth.Dining, { '2026-07': 60, '2026-08': 40 });
+    eq(s.byMerchant[0], { merchant: 'Chipotle', total: 100, count: 2, category: 'Dining', pctSpend: 100 / 160 });
+    eq(s.excludedCount, 1);
+  });
+
+  const failed = results.filter((r) => !r.ok);
+  document.getElementById('summary').innerHTML = failed.length
+    ? '<span class="fail">' + failed.length + ' of ' + results.length + ' failed</span>'
+    : '<span class="pass">All ' + results.length + ' tests passed</span>';
+  document.getElementById('results').innerHTML = results.map((r) =>
+    '<div class="' + (r.ok ? 'pass' : 'fail') + '">' + (r.ok ? '✓ ' : '✗ ') + SA.util.esc(r.name) + '</div>' +
+    (r.ok ? '' : '<pre>' + SA.util.esc(r.msg) + '</pre>')).join('');
+  document.title = failed.length ? 'FAIL' : 'PASS';
+})();
+</script>
+</body>
+</html>

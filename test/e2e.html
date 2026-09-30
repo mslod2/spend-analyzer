@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Spend Analyzer e2e</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 24px; }
+  .pass { color: #006300; } .fail { color: #d03b3b; font-weight: 600; }
+  iframe { width: 1280px; height: 900px; border: 1px solid #ccc; }
+</style>
+</head>
+<body>
+<!-- Serve the project over http (python3 -m http.server) so this page can script the app iframe. WIPES the app's local data. -->
+<h1>End-to-end</h1>
+<p id="summary">Running…</p>
+<div id="results"></div>
+<iframe id="app" src="../index.html#/import"></iframe>
+<script src="fixtures/fixtures.js"></script>
+<script>
+(async function () {
+  const out = [];
+  const log = (ok, name, msg) => { out.push({ ok, name, msg }); document.getElementById('summary').textContent = 'Running… ' + out.length + ' done, last: ' + name + (msg ? ' — ' + msg : ''); report((ok ? 'PASS ' : 'FAIL ') + name + (msg ? ' — ' + msg : '')); };
+  // ?report=1 posts progress to the test server (see test/README) for headless runs.
+  const report = (line) => { if (location.search.includes('report')) fetch('/log', { method: 'POST', body: line }).catch(() => {}); };
+  const frame = document.getElementById('app');
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  async function waitFor(fn, label, ms) {
+    const end = Date.now() + (ms || 5000);
+    while (Date.now() < end) { try { const v = fn(); if (v) return v; } catch (e) {} await sleep(25); }
+    throw new Error('Timed out waiting for: ' + label);
+  }
+  async function step(name, fn) {
+    try { await fn(); log(true, name); } catch (e) { log(false, name, e.message); }
+  }
+  const W = () => frame.contentWindow;
+  const $ = (sel) => W().document.querySelector(sel);
+  const $$ = (sel) => [...W().document.querySelectorAll(sel)];
+  const errors = [];
+
+  try { await waitFor(() => W().SA && W().SA.store && W().document.querySelector('main').children.length, 'app boot', 10000); }
+  catch (e) { const msg = 'Boot failed: ' + (W().document ? W().document.body.innerText.slice(0, 300) : 'no doc'); document.getElementById('summary').textContent = msg; report('DONE ' + msg); return; }
+  W().addEventListener('error', (e) => errors.push(e.message));
+  W().addEventListener('unhandledrejection', (e) => errors.push(String(e.reason)));
+  await W().SA.store.clearAll();
+  W().SA.ui.go('import');
+  const file = (name, key) => new (W().File)([FIXTURES[key]], name, { type: 'text/csv' });
+
+  await step('Chase file: recognized columns and preview', async () => {
+    await W().SA.views.import.addFiles([file('Chase1234_Activity.csv', 'chase')]);
+    const btn = await waitFor(() => $('[data-act="import"]'), 'import button');
+    if (!/Import \d+ transactions/.test(btn.textContent)) throw new Error('button: ' + btn.textContent);
+    const acct = $('[data-f="account"]').value;
+    if (acct !== 'Chase') throw new Error('account guess: ' + acct);
+    if ($('[data-f="chargesArePositive"]').value !== 'false') throw new Error('sign not detected');
+    if (!/5 payments\/transfers excluded/.test($('.preview-summary').textContent)) throw new Error('summary: ' + $('.preview-summary').textContent);
+  });
+
+  await step('Changing sign flips preview; changing back restores', async () => {
+    const sel = $('[data-f="chargesArePositive"]');
+    sel.value = 'true'; sel.dispatchEvent(new Event('change', { bubbles: true }));
+    try { await waitFor(() => $('.notice.warn'), 'sign warning', 2000); }
+    catch (e) { throw new Error(e.message + ' | value=' + $('[data-f="chargesArePositive"]').value + ' | ' + $('.preview-summary').textContent); }
+    const sel2 = $('[data-f="chargesArePositive"]');
+    sel2.value = 'false'; sel2.dispatchEvent(new Event('change', { bubbles: true }));
+    await waitFor(() => !$('.notice.warn'), 'warning cleared');
+  });
+
+  await step('Import Chase', async () => {
+    $('[data-act="import"]').click();
+    await waitFor(() => $('.notice.ok'), 'import result');
+    const n = W().SA.store.state.transactions.length;
+    if (n !== 192) throw new Error('expected 192 txns, got ' + n);
+  });
+
+  await step('Overlapping Chase export is fully deduped (saved mapping reused)', async () => {
+    await W().SA.views.import.addFiles([file('Chase1234_Activity (1).csv', 'chase_overlap')]);
+    const cards = await waitFor(() => $$('[data-key]').length === 2 && $$('[data-key]'), 'second card');
+    const btn = cards[1].querySelector('[data-act="import"]');
+    if (!btn.disabled || !/Nothing new/.test(btn.textContent)) throw new Error('button: ' + btn.textContent);
+    if (!/Recognized format/.test(cards[1].textContent)) throw new Error('mapping not recognized');
+    cards[1].querySelector('[data-act="remove"]').click();
+  });
+
+  await step('Import Amex + Capital One + no-header file together', async () => {
+    await W().SA.views.import.addFiles([file('amex.csv', 'amex'), file('capone.csv', 'capitalone'), file('wf.csv', 'wellsfargo')]);
+    await waitFor(() => $('[data-act="import-all"]'), 'import all');
+    const accts = $$('[data-f="account"]').map((i) => i.value);
+    if (JSON.stringify(accts) !== JSON.stringify(['Amex', 'Capital One', 'wf'])) throw new Error('accounts: ' + accts);
+    $('[data-act="import-all"]').click();
+    await waitFor(() => $$('.notice.ok').length === 4, 'four results');
+    const accounts = W().SA.store.accounts();
+    if (accounts.length !== 4) throw new Error('accounts: ' + accounts);
+  });
+
+  await step('Persisted to IndexedDB', async () => {
+    const rows = await W().SA.db.getAll('transactions');
+    if (rows.length !== W().SA.store.state.transactions.length) throw new Error(rows.length + ' in db');
+    if ((await W().SA.db.getAll('mappings')).length !== 4) throw new Error('mappings not saved');
+  });
+
+  await step('Card with no category column learns categories from other cards', async () => {
+    const wf = W().SA.store.state.transactions.filter((t) => t.account === 'wf' && t.amount > 0);
+    const chip = wf.filter((t) => t.merchant === 'Chipotle');
+    if (!chip.length || !chip.every((t) => t.category === 'Dining' && t.categorySource === 'learned')) throw new Error('Chipotle on wf: ' + chip.map((t) => t.category + '/' + t.categorySource));
+    const unc = wf.filter((t) => t.category === 'Uncategorized');
+    if (unc.length) throw new Error(unc.length + ' wf purchases still uncategorized: ' + unc.map((t) => t.merchant));
+  });
+
+  await step('Recategorize → save rule → other matches follow', async () => {
+    W().SA.ui.go('transactions', { account: 'wf' });
+    await waitFor(() => $('select[data-txn]'), 'txn rows');
+    const row = $$('select[data-txn]').find((s) => W().SA.store.getTxn(s.dataset.txn).merchant === 'Chipotle');
+    row.value = 'Shopping'; row.dispatchEvent(new Event('change', { bubbles: true }));
+    await waitFor(() => $('.rule-prompt'), 'rule prompt');
+    if ($('[data-p="pattern"]').value !== 'chipotle') throw new Error('pattern: ' + $('[data-p="pattern"]').value);
+    if (!/recategorizes \d+ other/.test($('[data-impact]').textContent)) throw new Error('impact: ' + $('[data-impact]').textContent);
+    $('[data-act="save-rule"]').click();
+    await waitFor(() => !$('.rule-prompt') && W().SA.store.state.rules.length === 1, 'rule saved');
+    const after = W().SA.store.state.transactions.filter((t) => t.merchant === 'Chipotle');
+    if (!after.every((t) => t.category === 'Shopping' && t.categorySource === 'rule')) throw new Error('not all Chipotle via rule: ' + after.map((t) => t.categorySource).join());
+  });
+
+  await step('Manual override beats rule; reset returns to rule', async () => {
+    const t = W().SA.store.state.transactions.find((x) => x.merchant === 'Chipotle');
+    await W().SA.store.setCategory(t.id, 'Groceries');
+    if (t.category !== 'Groceries' || t.categorySource !== 'manual') throw new Error('manual not applied');
+    await W().SA.store.saveRule(Object.assign({}, W().SA.store.state.rules[0]));
+    if (t.category !== 'Groceries') throw new Error('rule overwrote manual');
+    await W().SA.store.setCategory(t.id, null);
+    if (t.category !== 'Shopping' || t.categorySource !== 'rule') throw new Error('reset failed: ' + t.category + '/' + t.categorySource);
+  });
+
+  await step('Take-home pay (per paycheck)', async () => {
+    await W().SA.store.saveSettings({ income: { mode: 'paycheck', paycheck: 3100, frequency: 'biweekly', monthly: null } });
+    W().SA.ui.go('settings');
+    await waitFor(() => $('[data-inc-summary]'), 'settings');
+    if (!/6,716\.67 per month/.test($('[data-inc-summary]').textContent)) throw new Error($('[data-inc-summary]').textContent);
+  });
+
+  await step('Dashboard renders tiles, charts and tables', async () => {
+    W().SA.ui.go('dashboard');
+    await waitFor(() => $('#trend-chart'), 'dashboard');
+    const tiles = $$('.tile .value').map((e) => e.textContent);
+    if (tiles.length !== 4 || tiles.some((t) => !t || t === '—')) throw new Error('tiles: ' + tiles);
+    if (!W().Chart.getChart($('#cat-chart')) || !W().Chart.getChart($('#trend-chart'))) throw new Error('charts missing');
+    const catRows = $$('.split tbody tr');
+    if (catRows.length < 8) throw new Error('category rows: ' + catRows.length);
+    if (catRows.some((r) => /Payments/.test(r.textContent))) throw new Error('payments leaked into spending');
+    const headers = $$('.split thead th').map((e) => e.textContent);
+    if (!headers.includes('% of take-home')) throw new Error('no % of take-home column');
+    // Category totals must equal the net-spend tile.
+    const s = W().SA.analytics.summarize(W().SA.store.state.transactions, { excluded: W().SA.store.excludedSet(), monthlyIncome: 1, months: ['x'] });
+    const sumCats = s.byCategory.reduce((a, c) => a + c.total, 0);
+    if (Math.abs(sumCats - s.total) > 0.01) throw new Error('category sum ' + sumCats + ' != total ' + s.total);
+    if ($$('[data-merchant]').length !== 15) throw new Error('merchant rows: ' + $$('[data-merchant]').length);
+  });
+
+  await step('Dashboard filters: single month shows 6-month context; account filter', async () => {
+    const sel = $('[data-f="period"]');
+    sel.value = 'latest'; sel.dispatchEvent(new Event('change', { bubbles: true }));
+    await waitFor(() => /1 month/.test($('.range-label').textContent), 'range label');
+    const acct = $('[data-f="account"]');
+    acct.value = 'Amex'; acct.dispatchEvent(new Event('change', { bubbles: true }));
+    await waitFor(() => $('[data-f="account"]').value === 'Amex', 'account applied');
+    const p = $('[data-f="period"]'); p.value = 'all'; p.dispatchEvent(new Event('change', { bubbles: true }));
+    await waitFor(() => /5 months/.test($('.range-label').textContent), 'all');
+    const a2 = $('[data-f="account"]'); a2.value = ''; a2.dispatchEvent(new Event('change', { bubbles: true }));
+  });
+
+  await step('Spending over time: default windows per granularity', async () => {
+    W().SA.ui.go('dashboard', { period: 'all' });
+    await waitFor(() => $('#trend-chart'), 'trend chart');
+    const A = W().SA.analytics, U = W().SA.util;
+    const dates = W().SA.store.state.transactions.map((t) => t.date).sort();
+    const first = dates[0], last = dates[dates.length - 1];
+    const pick = async (by) => {
+      const r = $('input[name="trend-by"][value="' + by + '"]');
+      r.checked = true; r.dispatchEvent(new Event('change', { bubbles: true }));
+      await waitFor(() => $('input[name="trend-by"]:checked').value === by && W().Chart.getChart($('#trend-chart')), by);
+      return W().Chart.getChart($('#trend-chart')).data.labels.length;
+    };
+    const inputs = () => [$('[data-t="tstart"]').value, $('[data-t="tend"]').value];
+    // Month: latest 12 months, clamped to the first month with data.
+    const months = await pick('month');
+    const expMonths = U.monthRange(U.addMonths(last.slice(0, 7), -11) < first.slice(0, 7) ? first.slice(0, 7) : U.addMonths(last.slice(0, 7), -11), last.slice(0, 7)).length;
+    if (months !== expMonths) throw new Error('month buckets ' + months + ', expected ' + expMonths);
+    if (!/Most recent year/.test($('#trend-card').textContent)) throw new Error('no window label');
+    // Week: five whole weeks ending with the latest week.
+    if (await pick('week') !== 5) throw new Error('week buckets ' + W().Chart.getChart($('#trend-chart')).data.labels.length);
+    if (inputs()[0] !== A.weekStart(U.addDays(last, -27)) || inputs()[1] !== last) throw new Error('week range ' + inputs());
+    // Day: the latest seven days.
+    if (await pick('day') !== 7) throw new Error('day buckets');
+    if (inputs()[0] !== U.addDays(last, -6)) throw new Error('day start ' + inputs()[0]);
+    if (!/Most recent week/.test($('#trend-card').textContent)) throw new Error('day window label');
+  });
+
+  await step('Spending over time: custom date range, readability hint, reset, click-through', async () => {
+    const setDate = async (which, v, expect) => {
+      const i = $('[data-t="' + which + '"]'); i.value = v; i.dispatchEvent(new Event('change', { bubbles: true }));
+      await waitFor(() => $('[data-t="' + which + '"]').value === (expect || v) && /Custom range/.test($('#trend-card').textContent), which + '=' + v);
+    };
+    const firstDate = W().SA.store.state.transactions.map((t) => t.date).sort()[0];
+    await setDate('tstart', '2026-07-01');
+    await setDate('tend', '2026-07-31');
+    const chart = W().Chart.getChart($('#trend-chart'));
+    if (chart.data.labels.length !== 31) throw new Error('July by day: ' + chart.data.labels.length + ' buckets');
+    const bars = chart.data.datasets.filter((d) => d.type === 'bar');
+    const sum = bars.reduce((a, d) => a + d.data.reduce((x, y) => x + y, 0), 0);
+    const ex = W().SA.store.excludedSet();
+    const expected = W().SA.store.state.transactions.filter((t) => t.date >= '2026-07-01' && t.date <= '2026-07-31' && !ex.has(t.category)).reduce((a, t) => a + t.amount, 0);
+    if (Math.abs(sum - expected) > 0.05) throw new Error('July total ' + sum + ' vs ' + expected);
+    if (!/tstart=2026-07-01/.test(W().location.hash)) throw new Error('range not in URL');
+    // Range survives a granularity switch.
+    const wk = $('input[name="trend-by"][value="week"]'); wk.checked = true; wk.dispatchEvent(new Event('change', { bubbles: true }));
+    await waitFor(() => $('input[name="trend-by"]:checked').value === 'week', 'week');
+    if ($('[data-t="tstart"]').value !== '2026-07-01' || W().Chart.getChart($('#trend-chart')).data.labels[0] !== 'Jun 28') throw new Error('custom range lost on grain switch');
+    // A long range by day suggests a coarser grouping.
+    const dy = $('input[name="trend-by"][value="day"]'); dy.checked = true; dy.dispatchEvent(new Event('change', { bubbles: true }));
+    await waitFor(() => $('input[name="trend-by"]:checked').value === 'day', 'day');
+    await setDate('tstart', '2026-04-01', firstDate); // before any data: clamps to the first transaction
+    if (!/too thin to read/.test($('#trend-card').textContent)) throw new Error('no readability hint for ' + W().Chart.getChart($('#trend-chart')).data.labels.length + ' days');
+    $('#trend-card [data-act="trend-by"]').click();
+    await waitFor(() => $('input[name="trend-by"]:checked').value === 'week' && !/too thin/.test($('#trend-card').textContent), 'hint switches to week');
+    // Table row opens transactions for exactly the card's range.
+    const row = $('#trend-card tbody tr[data-cat="Groceries"]');
+    row.click();
+    await waitFor(() => W().location.hash.startsWith('#/transactions') && $('select[data-txn]'), 'transactions');
+    const shown = $$('select[data-txn]').map((s) => W().SA.store.getTxn(s.dataset.txn));
+    if (!shown.every((t) => t.date >= firstDate && t.date <= '2026-07-31' && t.category === 'Groceries')) throw new Error('transactions outside card range');
+    if (!new RegExp(W().SA.util.formatDate(firstDate) + ' – Jul 31, 2026').test($('.filters').textContent)) throw new Error('no date range badge');
+    // Reset returns to the default window.
+    W().SA.ui.go('dashboard', { by: 'week', tstart: '2026-07-01', tend: '2026-07-31' });
+    await waitFor(() => $('[data-act="trend-reset"]'), 'reset button');
+    $('[data-act="trend-reset"]').click();
+    await waitFor(() => /Most recent month/.test($('#trend-card').textContent) && !$('[data-act="trend-reset"]'), 'reset');
+    if (W().Chart.getChart($('#trend-chart')).data.labels.length !== 5) throw new Error('reset did not restore 5 weeks');
+  });
+
+  await step('Category row click opens filtered transactions', async () => {
+    await waitFor(() => $('.split tbody tr'), 'rows');
+    $('.split tbody tr[data-cat="Dining"]').click();
+    await waitFor(() => W().location.hash.startsWith('#/transactions') && $('select[data-f="category"]'), 'transactions view');
+    if ($('select[data-f="category"]').value !== 'Dining') throw new Error('category filter not applied');
+  });
+
+  await step('Transactions sort by any column, both directions', async () => {
+    W().SA.ui.go('transactions', { hideExcluded: '' });
+    await waitFor(() => $('[data-sort="amount"]'), 'sortable headers');
+    const rowTxns = () => $$('select[data-txn]').map((s) => W().SA.store.getTxn(s.dataset.txn));
+    const isSorted = (arr, cmp) => arr.every((x, i) => i === 0 || cmp(arr[i - 1], x) <= 0);
+    const click = async (key, expectDir) => {
+      $('[data-sort="' + key + '"]').click();
+      await waitFor(() => $('[data-sort="' + key + '"]').closest('th').getAttribute('aria-sort') === expectDir, key + ' ' + expectDir);
+    };
+    await click('amount', 'descending');
+    if (!isSorted(rowTxns(), (a, b) => b.amount - a.amount)) throw new Error('amount not high→low');
+    if (!/sort=amount/.test(W().location.hash) || !/dir=desc/.test(W().location.hash)) throw new Error('sort not in URL: ' + W().location.hash);
+    await click('amount', 'ascending');
+    if (!isSorted(rowTxns(), (a, b) => a.amount - b.amount)) throw new Error('amount not low→high');
+    const coll = new Intl.Collator(undefined, { sensitivity: 'base', numeric: true });
+    await click('merchant', 'ascending');
+    if (!isSorted(rowTxns(), (a, b) => coll.compare(a.merchant, b.merchant))) throw new Error('merchant not A→Z');
+    await click('merchant', 'descending');
+    if (!isSorted(rowTxns(), (a, b) => coll.compare(b.merchant, a.merchant))) throw new Error('merchant not Z→A');
+    await click('category', 'ascending');
+    if (!isSorted(rowTxns(), (a, b) => coll.compare(a.category, b.category))) throw new Error('category not A→Z');
+    await click('date', 'descending');
+    if (!isSorted(rowTxns(), (a, b) => b.date.localeCompare(a.date))) throw new Error('date not newest first');
+    if (/sort=/.test(W().location.hash)) throw new Error('default sort should clear URL param');
+    await click('date', 'ascending');
+    if (!isSorted(rowTxns(), (a, b) => a.date.localeCompare(b.date))) throw new Error('date not oldest first');
+  });
+
+  await step('Backup export → wipe → restore round-trips', async () => {
+    const data = JSON.parse(JSON.stringify(await W().SA.store.exportBackup()));
+    const n = data.transactions.length;
+    await W().SA.store.clearAll();
+    if (W().SA.store.state.transactions.length) throw new Error('not cleared');
+    await W().SA.store.restoreBackup(data, 'replace');
+    if (W().SA.store.state.transactions.length !== n) throw new Error('restored ' + W().SA.store.state.transactions.length + ' of ' + n);
+    if (W().SA.store.state.rules.length !== 1) throw new Error('rules not restored');
+    if (W().SA.analytics.monthlyIncome(W().SA.store.state.settings.income) !== 3100 * 26 / 12) throw new Error('income not restored');
+    await W().SA.store.restoreBackup(data, 'merge');
+    if (W().SA.store.state.transactions.length !== n) throw new Error('merge duplicated rows');
+    let threw = false;
+    try { await W().SA.store.restoreBackup({ foo: 1 }, 'replace'); } catch (e) { threw = true; }
+    if (!threw || W().SA.store.state.transactions.length !== n) throw new Error('bad backup not rejected');
+  });
+
+  await step('Rename + delete category keep data consistent', async () => {
+    await W().SA.store.renameCategory('Shopping', 'Retail');
+    const st = W().SA.store.state;
+    if (st.transactions.some((t) => t.category === 'Shopping')) throw new Error('Shopping remains');
+    if (st.rules[0].category !== 'Retail') throw new Error('rule not renamed');
+    await W().SA.store.deleteCategory('Retail');
+    if (st.rules.length !== 0) throw new Error('rule not deleted');
+    if (st.transactions.some((t) => t.category === 'Retail')) throw new Error('Retail remains');
+    await W().SA.store.addCategory('Shopping');
+    // Put the mappings back so screenshots look right.
+    for (const k of ['shopping', 'merchandise', 'merchandise & supplies']) await W().SA.store.setIssuerMapping(k, 'Shopping');
+    await W().SA.store.saveRule({ field: 'merchant', matchType: 'contains', pattern: 'chipotle', category: 'Dining' });
+    W().SA.ui.go('dashboard');
+  });
+
+  await step('No uncaught errors in the app', async () => { if (errors.length) throw new Error(errors.join(' | ')); });
+
+  const failed = out.filter((r) => !r.ok);
+  document.getElementById('summary').innerHTML = failed.length ? '<span class="fail">' + failed.length + ' of ' + out.length + ' failed</span>' : '<span class="pass">All ' + out.length + ' steps passed</span>';
+  document.getElementById('results').innerHTML = out.map((r) => '<div class="' + (r.ok ? 'pass' : 'fail') + '">' + (r.ok ? '✓ ' : '✗ ') + r.name + (r.msg ? ' — ' + r.msg.replace(/</g, '&lt;') : '') + '</div>').join('');
+  document.title = failed.length ? 'FAIL' : 'PASS';
+  report('DONE ' + (failed.length ? failed.length + ' failed' : 'all ' + out.length + ' passed'));
+})();
+</script>
+</body>
+</html>
